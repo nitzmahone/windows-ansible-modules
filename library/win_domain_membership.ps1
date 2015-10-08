@@ -149,13 +149,13 @@ Function Module-Impl {
         [string] $domain_admin_user,
         [string] $domain_admin_pass,
         [string] $state, # domain, workgroup
-        [string] $log_path_in = $null,
+        [string] $log_path = $null,
         [bool] $_ansible_check_mode = $false # default to false since 1.x won't pass this
     )
 
     # TODO: validate args
 
-    $log_path = $log_path_in
+    $global:log_path = $log_path
 
     $result = @{
         changed = $false
