@@ -24,7 +24,7 @@ Function Write-DebugLog {
 
     Write-Debug $msg
 
-    if($log_path -ne $null) {
+    if($log_path) {
         Add-Content $log_path $msg
     }
 }
@@ -34,7 +34,6 @@ Function Get-DnsClientMatch {
         [string] $adapter_name,
         [string[]] $ipv4_addresses
     )
-
     # NB: these cmdlets require Win8/Server 2012+, consider WMI version for 2008
 
     Write-DebugLog ("Getting DNS config for adapter {0}" -f $adapter_name)
@@ -87,44 +86,54 @@ Function Module-Impl {
 
     $global:log_path = $log_path
 
-    $changed = $false
+    Try {
 
-    Write-DebugLog ("Validating adapter name {0}" -f $adapter_names)
+        $changed = $false
 
-    $adapters = @($adapter_names)
+        Write-DebugLog ("Validating adapter name {0}" -f $adapter_names)
 
-    If($adapter_names -eq "*") {
-        $adapters = Get-NetAdapter | Select-Object -ExpandProperty Name
-    }
-    # TODO: add support for an actual list of adapter names
-    # validate network adapter names
-    ElseIf(@(Get-NetAdapter | Where-Object Name -eq $adapter_names).Count -eq 0) {
-        throw "Invalid network adapter name: {0}" -f $adapter_names
-    }
+        $adapters = @($adapter_names)
 
-    Write-DebugLog ("Validating IP addresses ({0})" -f ($ipv4_addresses -join ", "))
+        If($adapter_names -eq "*") {
+            $adapters = Get-NetAdapter | Select-Object -ExpandProperty Name
+        }
+        # TODO: add support for an actual list of adapter names
+        # validate network adapter names
+        ElseIf(@(Get-NetAdapter | Where-Object Name -eq $adapter_names).Count -eq 0) {
+            throw "Invalid network adapter name: {0}" -f $adapter_names
+        }
 
-    $invalid_addresses = @($ipv4_addresses | ? { -not (Validate-IPAddress $_) })
+        Write-DebugLog ("Validating IP addresses ({0})" -f ($ipv4_addresses -join ", "))
 
-    If($invalid_addresses.Count -gt 0) {
-        throw "Invalid IP address(es): ({0})" -f ($invalid_addresses -join ", ")
-    }
+        $invalid_addresses = @($ipv4_addresses | ? { -not (Validate-IPAddress $_) })
 
-    ForEach($adapter_name in $adapters) {
-        $changed = $changed -or (-not (Get-DnsClientMatch $adapter_name $ipv4_addresses))
+        If($invalid_addresses.Count -gt 0) {
+            throw "Invalid IP address(es): ({0})" -f ($invalid_addresses -join ", ")
+        }
 
-        If($changed) {
-            If(-not $check_mode) {
-                Set-DnsClientAddresses $adapter_name $ipv4_addresses
-            }
-            Else {
-                Write-DebugLog "Check mode, skipping"
+        ForEach($adapter_name in $adapters) {
+            $changed = $changed -or (-not (Get-DnsClientMatch $adapter_name $ipv4_addresses))
+
+            If($changed) {
+                If(-not $check_mode) {
+                    Set-DnsClientAddresses $adapter_name $ipv4_addresses
+                }
+                Else {
+                    Write-DebugLog "Check mode, skipping"
+                }
             }
         }
+
+        return @{changed=$changed}
+
     }
+    Catch {
+        $excep = $_
 
-    return @{changed=$changed}
+        Write-DebugLog "Exception: $($excep | out-string)"
 
+        Throw
+    }
 }
 
 $p = Parse-Args -arguments $args -supports_check_mode $true
