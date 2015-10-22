@@ -157,79 +157,89 @@ Function Module-Impl {
 
     $global:log_path = $log_path
 
-    $result = @{
-        changed = $false
-        reboot_required = $false
-    }
+    Try {
 
-    $hostname_match = If($hostname) { Get-HostnameMatch $hostname } Else { $true }
+        $result = @{
+            changed = $false
+            reboot_required = $false
+        }
 
-    $result.changed = $result.changed -or (-not $hostname_match)
+        $hostname_match = If($hostname) { Get-HostnameMatch $hostname } Else { $true }
 
-    Switch($state) {
-        domain {
-            $domain_match = Get-DomainMembershipMatch $dns_domain_name
+        $result.changed = $result.changed -or (-not $hostname_match)
 
-            $result.changed = $result.changed -or (-not $domain_match)
+        Switch($state) {
+            domain {
+                $domain_match = Get-DomainMembershipMatch $dns_domain_name
 
-            If($result.changed -and -not $_ansible_check_mode) {
-                If(-not $domain_match) {
-                    If(Is-DomainJoined) {
-                        Write-DebugLog "domain doesn't match, and we're already joined to another domain"
-                        throw "switching domains is not implemented"
+                $result.changed = $result.changed -or (-not $domain_match)
+
+                If($result.changed -and -not $_ansible_check_mode) {
+                    If(-not $domain_match) {
+                        If(Is-DomainJoined) {
+                            Write-DebugLog "domain doesn't match, and we're already joined to another domain"
+                            throw "switching domains is not implemented"
+                        }
+                                
+                        $join_args = @{
+                            dns_domain_name = $dns_domain_name
+                            domain_admin_user = $domain_admin_user
+                            domain_admin_pass = $domain_admin_pass
+                        }
+
+                        Write-DebugLog "not a domain member, joining..."
+
+                        If(-not $hostname_match) {
+                            Write-DebugLog "adding hostname change to domain-join args"
+                            $join_args.new_hostname = $hostname
+                        }
+
+                        $join_result = Join-Domain @join_args
                     }
-                            
-                    $join_args = @{
-                        dns_domain_name = $dns_domain_name
-                        domain_admin_user = $domain_admin_user
-                        domain_admin_pass = $domain_admin_pass
+                    ElseIf(-not $hostname_match) { # domain matches but hostname doesn't, just do a rename
+                        Write-DebugLog ("domain matches, setting hostname to {0}" -f $hostname)
+                        $rename_result = Rename-Computer -NewName $hostname
                     }
 
-                    Write-DebugLog "not a domain member, joining..."
+                    # all these changes require a reboot
+                    $result.reboot_required = $true
+                }
+                Else {
+                    Write-DebugLog "check mode, exiting early..."
+                }
 
+            }
+
+            workgroup {
+                $workgroup_match = $(Get-Workgroup) -eq $workgroup_name
+
+                $result.changed = $result.changed -or (-not $workgroup_match)
+
+                If(-not $_ansible_check_mode) {
+                    If(-not $workgroup_match) {
+                        Write-DebugLog ("setting workgroup to {0}" -f $workgroup_name)
+                        $join_wg_result = Join-Workgroup -workgroup_name $workgroup_name -domain_admin_user $domain_admin_user -domain_admin_pass $domain_admin_pass
+                        $result.reboot_required = $true
+                    }
                     If(-not $hostname_match) {
-                        Write-DebugLog "adding hostname change to domain-join args"
-                        $join_args.new_hostname = $hostname
+                        Write-DebugLog ("setting hostname to {0}" -f $hostname)
+                        $rename_result = Rename-Computer -NewName $hostname
+                        $result.reboot_required = $true
                     }
-
-                    $join_result = Join-Domain @join_args
                 }
-                ElseIf(-not $hostname_match) { # domain matches but hostname doesn't, just do a rename
-                    Write-DebugLog ("domain matches, setting hostname to {0}" -f $hostname)
-                    $rename_result = Rename-Computer -NewName $hostname
-                }
-
-                # all these changes require a reboot
-                $result.reboot_required = $true
             }
-            Else {
-                Write-DebugLog "check mode, exiting early..."
-            }
-
+            default { throw "invalid state $state" }
         }
 
-        workgroup {
-            $workgroup_match = $(Get-Workgroup) -eq $workgroup_name
-
-            $result.changed = $result.changed -or (-not $workgroup_match)
-
-            If(-not $_ansible_check_mode) {
-                If(-not $workgroup_match) {
-                    Write-DebugLog ("setting workgroup to {0}" -f $workgroup_name)
-                    $join_wg_result = Join-Workgroup -workgroup_name $workgroup_name -domain_admin_user $domain_admin_user -domain_admin_pass $domain_admin_pass
-                    $result.reboot_required = $true
-                }
-                If(-not $hostname_match) {
-                    Write-DebugLog ("setting hostname to {0}" -f $hostname)
-                    $rename_result = Rename-Computer -NewName $hostname
-                    $result.reboot_required = $true
-                }
-            }
-        }
-        default { throw "invalid state $state" }
+        return $result
     }
+    Catch {
+        $excep = $_
 
-    return $result
+        Write-DebugLog "Exception: $($excep | out-string)"
+
+        Throw
+    }
     
 }
 
