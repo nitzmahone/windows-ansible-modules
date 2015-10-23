@@ -104,65 +104,99 @@ Function Module-Impl {
 
     $global:log_path = $log_path
 
-    $result = @{
-        changed = $false
-        reboot_required = $false
-    }
+    Try {
 
-    # ensure that domain admin user is in UPN or down-level domain format (prevent hang from https://support.microsoft.com/en-us/kb/2737935)
+        $result = @{
+            changed = $false
+            reboot_required = $false
+        }
 
-    If(-not $domain_admin_user.Contains("\") -and -not $domain_admin_user.Contains("@")) {
-        throw "domain_admin_user must be in domain\user or user@domain.com format"
-    }
-	
-    # TODO: validate args
+        # ensure that domain admin user is in UPN or down-level domain format (prevent hang from https://support.microsoft.com/en-us/kb/2737935)
 
-    # short-circuit "member server" check, since we don't need feature checks for this...
+        If(-not $domain_admin_user.Contains("\") -and -not $domain_admin_user.Contains("@")) {
+            throw "domain_admin_user must be in domain\user or user@domain.com format"
+        }
+    	
+        # TODO: validate args
 
-    $current_dc_domain = Get-DomainControllerDomain
+        # short-circuit "member server" check, since we don't need feature checks for this...
 
-    If($state -eq "member_server" -and -not $current_dc_domain) {
-        Return $result
-    }
+        $current_dc_domain = Get-DomainControllerDomain
 
-    # all other operations will require the AD-DS and RSAT-ADDS features...
-
-    $missing_features = Get-MissingFeatures
-
-    If($missing_features.Count -gt 0) {
-        Write-DebugLog ("Missing Windows features ({0}), need to install" -f ($missing_features -join ", "))
-        $result.changed = $true # we need to install features
-        If($_ansible_check_mode) {
-            # bail out here- we can't proceed without knowing the features are installed
-            Write-DebugLog "check-mode, exiting early"
+        If($state -eq "member_server" -and -not $current_dc_domain) {
             Return $result
         }
 
-        Ensure-FeatureInstallation | Out-Null
-    }
+        # all other operations will require the AD-DS and RSAT-ADDS features...
 
-    # TODO: check for pending reboot on domain join or domain controller creation
-    
-    $domain_admin_cred = Create-Credential -cred_user $domain_admin_user -cred_pass $domain_admin_pass
+        $missing_features = Get-MissingFeatures
 
-    switch($state) {
-        domain_controller {
-            If(-not $safe_mode_pass) {
-                throw "safe_mode_pass is required for state=domain_controller"
+        If($missing_features.Count -gt 0) {
+            Write-DebugLog ("Missing Windows features ({0}), need to install" -f ($missing_features -join ", "))
+            $result.changed = $true # we need to install features
+            If($_ansible_check_mode) {
+                # bail out here- we can't proceed without knowing the features are installed
+                Write-DebugLog "check-mode, exiting early"
+                Return $result
             }
 
-            If($current_dc_domain) {
-                # TODO: implement managed Remove/Add to change domains
-            
-                If($current_dc_domain -ne $dns_domain_name) {
-                    Throw "$(hostname) is a domain controller for domain $current_dc_domain; changing DC domains is not implemented"
+            Ensure-FeatureInstallation | Out-Null
+        }
+
+        # TODO: check for pending reboot on domain join or domain controller creation
+        
+        $domain_admin_cred = Create-Credential -cred_user $domain_admin_user -cred_pass $domain_admin_pass
+
+        switch($state) {
+            domain_controller {
+                If(-not $safe_mode_pass) {
+                    throw "safe_mode_pass is required for state=domain_controller"
+                }
+
+                If($current_dc_domain) {
+                    # TODO: implement managed Remove/Add to change domains
+                
+                    If($current_dc_domain -ne $dns_domain_name) {
+                        Throw "$(hostname) is a domain controller for domain $current_dc_domain; changing DC domains is not implemented"
+                    }
+                }
+
+                # need to promote to DC
+                If(-not $current_dc_domain) {
+                    Write-DebugLog "Not currently a domain controller; needs promotion"
+                    $result.changed = $true
+                    If($_ansible_check_mode) {
+                        Write-DebugLog "check-mode, exiting early"
+                        Return $result
+                    }
+
+                    $result.reboot_required = $true
+
+                    $safe_mode_secure = $safe_mode_pass | ConvertTo-SecureString -AsPlainText -Force
+                    Write-DebugLog "Installing domain controller..."
+
+                    $install_result = Install-ADDSDomainController -NoRebootOnCompletion -DomainName $dns_domain_name -Credential $domain_admin_cred -SafeModeAdministratorPassword $safe_mode_secure -Force
+                    
+                    Write-DebugLog "Installation completed, needs reboot..."
                 }
             }
-
-            # need to promote to DC
-            If(-not $current_dc_domain) {
-                Write-DebugLog "Not currently a domain controller; needs promotion"
+            member_server {
+                If(-not $local_admin_pass) {
+                    throw "local_admin_pass is required for state=domain_controller"
+                }
+                # at this point we already know we're a DC and shouldn't be...
+                Write-DebugLog "Need to uninstall domain controller..."
                 $result.changed = $true
+
+                Write-DebugLog "Checking for operation master roles assigned to this DC..."
+
+                $assigned_roles = Get-OperationMasterRoles
+
+                # TODO: figure out a sane way to hand off roles automatically (designated recipient server, randomly look one up?)
+                If($assigned_roles.Count -gt 0) {
+                    Throw ("This domain controller has operation master role(s) ({0}) assigned; they must be moved to other DCs before demotion (see Move-ADDirectoryServerOperationMasterRole)" -f ($assigned_roles -join ", "))
+                }
+
                 If($_ansible_check_mode) {
                     Write-DebugLog "check-mode, exiting early"
                     Return $result
@@ -170,60 +204,36 @@ Function Module-Impl {
 
                 $result.reboot_required = $true
 
-                $safe_mode_secure = $safe_mode_pass | ConvertTo-SecureString -AsPlainText -Force
-                Write-DebugLog "Installing domain controller..."
+                $local_admin_secure = $local_admin_pass | ConvertTo-SecureString -AsPlainText -Force
 
-                $install_result = Install-ADDSDomainController -NoRebootOnCompletion -DomainName $dns_domain_name -Credential $domain_admin_cred -SafeModeAdministratorPassword $safe_mode_secure -Force
-                
-                Write-DebugLog "Installation completed, needs reboot..."
+                Write-DebugLog "Uninstalling domain controller..."
+                $uninstall_result = Uninstall-ADDSDomainController -NoRebootOnCompletion -LocalAdministratorPassword $local_admin_secure -Credential $domain_admin_cred 
+                Write-DebugLog "Uninstallation complete, needs reboot..."
+
+                # we have to initiate the reboot now because domain credentials are no longer valid, 
+                # and the local SAM DB isn't usable for auth until after the reboot...
+
+                # note that without an action wrapper, in the case where a DC is demoted,
+                # the task will fail with a 401 Unauthorized, because the domain credential
+                # becomes invalid to fetch the final output over WinRM. 
+
+                shutdown /r /t 5
+
+                # TODO: remove features
+
             }
+            default { throw ("invalid state {0}" -f $state) }
         }
-        member_server {
-            If(-not $local_admin_pass) {
-                throw "local_admin_pass is required for state=domain_controller"
-            }
-            # at this point we already know we're a DC and shouldn't be...
-            Write-DebugLog "Need to uninstall domain controller..."
-            $result.changed = $true
 
-            Write-DebugLog "Checking for operation master roles assigned to this DC..."
-
-            $assigned_roles = Get-OperationMasterRoles
-
-            # TODO: figure out a sane way to hand off roles automatically (designated recipient server, randomly look one up?)
-            If($assigned_roles.Count -gt 0) {
-                Throw ("This domain controller has operation master role(s) ({0}) assigned; they must be moved to other DCs before demotion (see Move-ADDirectoryServerOperationMasterRole)" -f ($assigned_roles -join ", "))
-            }
-
-            If($_ansible_check_mode) {
-                Write-DebugLog "check-mode, exiting early"
-                Return $result
-            }
-
-            $result.reboot_required = $true
-
-            $local_admin_secure = $local_admin_pass | ConvertTo-SecureString -AsPlainText -Force
-
-            Write-DebugLog "Uninstalling domain controller..."
-            $uninstall_result = Uninstall-ADDSDomainController -NoRebootOnCompletion -LocalAdministratorPassword $local_admin_secure -Credential $domain_admin_cred 
-            Write-DebugLog "Uninstallation complete, needs reboot..."
-
-            # we have to initiate the reboot now because domain credentials are no longer valid, 
-            # and the local SAM DB isn't usable for auth until after the reboot...
-
-            # note that without an action wrapper, in the case where a DC is demoted,
-            # the task will fail with a 401 Unauthorized, because the domain credential
-            # becomes invalid to fetch the final output over WinRM. 
-
-            shutdown /r /t 5
-
-            # TODO: remove features
-
-        }
-        default { throw ("invalid state {0}" -f $state) }
+        return $result
     }
+    Catch {
+        $excep = $_
 
-    return $result
+        Write-DebugLog "Exception: $($excep | out-string)"
+
+        Throw
+    }
 }
 
 $p = Parse-Args -arguments $args -supports_check_mode $true
