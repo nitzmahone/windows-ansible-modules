@@ -34,15 +34,21 @@ Function Get-DnsClientMatch {
         [string] $adapter_name,
         [string[]] $ipv4_addresses
     )
-    # NB: these cmdlets require Win8/Server 2012+, consider WMI version for 2008
 
     Write-DebugLog ("Getting DNS config for adapter {0}" -f $adapter_name)
-
-    $current_dns_all = Get-DnsClientServerAddress -InterfaceAlias $adapter_name
+    Try {
+        # Try the 2012+ way first
+        $current_dns_all = Get-DnsClientServerAddress -InterfaceAlias $adapter_name
+        $current_dns_v4 = ($current_dns_all | Where-Object AddressFamily -eq 2 <# IPv4 #>).ServerAddresses
+    }
+    Catch {
+        # Must be older system < 2012
+       $current_dns_all = Get-WMIObject Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -eq "TRUE" -and $_.Description -eq $adapter_name}
+       $current_dns_v4 = $current_dns_all.DNSServerSearchOrder
+    }
 
     Write-DebugLog ("Current DNS settings: " + $($current_dns_all | Out-String))
 
-    $current_dns_v4 = ($current_dns_all | Where-Object AddressFamily -eq 2 <# IPv4 #>).ServerAddresses
 
     $v4_match = @(Compare-Object $current_dns_v4 $ipv4_addresses).Count -eq 0
     
@@ -55,10 +61,14 @@ Function Get-DnsClientMatch {
 
 Function Validate-IPAddress {
     Param([string] $address)
+    Try {
+        [ipaddress]$address
+    }
+    Catch {
+        return $false
+    }
 
-    $addrout = $null
-
-    return [System.Net.IPAddress]::TryParse($address, [ref] $addrout)
+    return $true
 }
 
 Function Set-DnsClientAddresses
@@ -70,8 +80,15 @@ Function Set-DnsClientAddresses
 
     Write-DebugLog ("Setting DNS addresses for adapter {0} to ({1})" -f $adapter_name, ($ipv4_addresses -join ", "))
 
-    # this silently ignores invalid IPs, so we validate parseability ourselves up front...
-    Set-DnsClientServerAddress -InterfaceAlias $adapter_name -ServerAddresses $ipv4_addresses
+    If ($is_2012){
+        # this silently ignores invalid IPs, so we validate parseability ourselves up front...
+        Set-DnsClientServerAddress -InterfaceAlias $adapter_name -ServerAddresses $ipv4_addresses
+    }
+    Else {
+        $adapter = Get-WMIObject Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -eq "TRUE" -and $_.Description -eq $adapter_name}
+        $addresses = $ipv4_addresses -join ","
+        $adapter.SetDNSServerSearchOrder($addresses)
+    }
 
     # TODO: implement IPv6
 }
@@ -87,7 +104,6 @@ Function Module-Impl {
     $global:log_path = $log_path
 
     Try {
-
         $changed = $false
 
         Write-DebugLog ("Validating adapter name {0}" -f $adapter_names)
@@ -95,12 +111,33 @@ Function Module-Impl {
         $adapters = @($adapter_names)
 
         If($adapter_names -eq "*") {
+            If ($is_2012) {
             $adapters = Get-NetAdapter | Select-Object -ExpandProperty Name
+            }
+            Else {
+            $adapters = Get-WmiObject Win32_NetworkAdapterconfiguration -filter "ipenabled = 'true'"
+            }
         }
         # TODO: add support for an actual list of adapter names
         # validate network adapter names
-        ElseIf(@(Get-NetAdapter | Where-Object Name -eq $adapter_names).Count -eq 0) {
-            throw "Invalid network adapter name: {0}" -f $adapter_names
+        Else {
+            If ($is_2012) {
+                Try {
+                    @(Get-NetAdapter | Where-Object Name -eq $adapter_names).Count -eq 0 
+                }
+                Catch {
+                    Fail-Json "Invalid network adapter name: {0}" -f $adapter_names
+                }
+            }
+            Else {
+                Try {
+                    @(Get-WmiObject Win32_NetworkAdapterconfiguration -filter "ipenabled = 'true'" | Where-Object Description -eq $adapter_names).Count -eq 0
+                }
+                Catch {
+                    Fail-Json "Invalid network adapter name: {0}" -f $adapter_names
+                }
+
+            }
         }
 
         Write-DebugLog ("Validating IP addresses ({0})" -f ($ipv4_addresses -join ", "))
@@ -124,7 +161,7 @@ Function Module-Impl {
             }
         }
 
-        return @{changed=$changed}
+        $result.changed = $changed
 
     }
     Catch {
@@ -136,12 +173,21 @@ Function Module-Impl {
     }
 }
 
+$is_2012 = $true
+If([System.Environment]::OSVersion.Version -lt [Version]"6.3.9600.0"){
+    $is_2012 = $false
+}
+
+$result = New-Object psobject @{
+    changed = $false
+};
+
 $p = Parse-Args -arguments $args -supports_check_mode $true
 
 # NB: this conversion only works for flat args
 $p.psobject.properties | foreach -begin {$module_args=@{}} -process {$module_args."$($_.Name)" = $_.Value} -end {$module_args} | Out-Null
 
-$result = Module-Impl @module_args
+Module-Impl @module_args
 
 Exit-Json $result
 
