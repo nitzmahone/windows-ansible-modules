@@ -43,8 +43,14 @@ Function Get-DnsClientMatch {
     }
     Catch {
         # Must be older system < 2012
-       $current_dns_all = Get-WMIObject Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -eq "TRUE" -and $_.Description -eq $adapter_name}
-       $current_dns_v4 = $current_dns_all.DNSServerSearchOrder
+       If ($adapter_name -eq '*'){
+           $current_dns_all = Get-WMIObject Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -eq "TRUE"}
+           $current_dns_v4 = $current_dns_all.DNSServerSearchOrder
+       }
+       Else {
+           $current_dns_all = Get-WMIObject Win32_NetworkAdapterConfiguration | Where-Object {$_.IPEnabled -eq "TRUE" -and $_.Description -eq $adapter_name}
+           $current_dns_v4 = $current_dns_all.DNSServerSearchOrder
+       }
     }
 
     Write-DebugLog ("Current DNS settings: " + $($current_dns_all | Out-String))
@@ -115,7 +121,7 @@ Function Module-Impl {
             $adapters = Get-NetAdapter | Select-Object -ExpandProperty Name
             }
             Else {
-            $adapters = Get-WmiObject Win32_NetworkAdapterconfiguration -filter "ipenabled = 'true'"
+            $adapters = Get-WmiObject Win32_NetworkAdapterconfiguration -filter "ipenabled = 'true'" | % {$_.Description}
             }
         }
         # TODO: add support for an actual list of adapter names
